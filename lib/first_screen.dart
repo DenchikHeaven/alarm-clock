@@ -3,27 +3,18 @@ import 'dart:ui' show FontFeature;
 
 import 'package:flutter/material.dart';
 
+import 'models/alarm_model.dart';
+import 'services/alarm_service.dart';
+
 /// Перший екран додатку «Будильник»: поточний час, найближчий будильник
-/// та список будильників з перемикачами.
+/// та список будильників з перемикачами. Усе працює по-справжньому:
+/// будильники зберігаються і дзвонять у вказаний час, навіть коли
+/// застосунок закритий.
 class FirstScreen extends StatefulWidget {
   const FirstScreen({super.key});
 
   @override
   State<FirstScreen> createState() => _FirstScreenState();
-}
-
-class _AlarmItem {
-  _AlarmItem({
-    required this.time,
-    required this.label,
-    required this.days,
-    this.enabled = true,
-  });
-
-  final TimeOfDay time;
-  final String label;
-  final String days;
-  bool enabled;
 }
 
 class _FirstScreenState extends State<FirstScreen> {
@@ -56,27 +47,10 @@ class _FirstScreenState extends State<FirstScreen> {
     'грудня',
   ];
 
+  final _service = AlarmService.instance;
+
   late DateTime _now;
   Timer? _timer;
-
-  final List<_AlarmItem> _alarms = [
-    _AlarmItem(
-      time: const TimeOfDay(hour: 6, minute: 30),
-      label: 'Підйом',
-      days: 'Пн – Пт',
-    ),
-    _AlarmItem(
-      time: const TimeOfDay(hour: 8, minute: 0),
-      label: 'Вихідні',
-      days: 'Сб, Нд',
-      enabled: false,
-    ),
-    _AlarmItem(
-      time: const TimeOfDay(hour: 22, minute: 45),
-      label: 'Лягати спати',
-      days: 'Щодня',
-    ),
-  ];
 
   @override
   void initState() {
@@ -85,6 +59,8 @@ class _FirstScreenState extends State<FirstScreen> {
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() => _now = DateTime.now());
     });
+    // Без цих дозволів Android може не дати будильнику спрацювати.
+    unawaited(_service.requestPermissions());
   }
 
   @override
@@ -95,71 +71,70 @@ class _FirstScreenState extends State<FirstScreen> {
 
   String _two(int v) => v.toString().padLeft(2, '0');
 
-  String _fmt(TimeOfDay t) => '${_two(t.hour)}:${_two(t.minute)}';
-
   /// Текст «Наступний будильник через …» для найближчого увімкненого.
   String? _nextAlarmText() {
-    Duration? best;
-    for (final a in _alarms.where((a) => a.enabled)) {
-      var target = DateTime(
-        _now.year,
-        _now.month,
-        _now.day,
-        a.time.hour,
-        a.time.minute,
-      );
-      if (!target.isAfter(_now)) target = target.add(const Duration(days: 1));
-      final diff = target.difference(_now);
-      if (best == null || diff < best) best = diff;
-    }
-    if (best == null) return null;
-    final h = best.inHours;
-    final m = best.inMinutes % 60;
-    if (h == 0) return 'Наступний будильник через $m хв';
-    return 'Наступний будильник через $h год $m хв';
+    final next = _service.nextRing();
+    if (next == null) return null;
+    final diff = next.difference(_now);
+    final totalMin = diff.inMinutes + (diff.inSeconds % 60 > 0 ? 1 : 0);
+    final d = totalMin ~/ (24 * 60);
+    final h = (totalMin % (24 * 60)) ~/ 60;
+    final m = totalMin % 60;
+    final parts = <String>[
+      if (d > 0) '$d д',
+      if (h > 0) '$h год',
+      if (m > 0 || (d == 0 && h == 0)) '$m хв',
+    ];
+    return 'Наступний будильник через ${parts.join(' ')}';
   }
 
-  Future<void> _addAlarm() async {
-    final picked = await showTimePicker(
+  Future<void> _openEditor([AlarmModel? existing]) async {
+    final result = await showModalBottomSheet<_EditorResult>(
       context: context,
-      initialTime: TimeOfDay.now(),
-      builder: (context, child) => Theme(
-        data: Theme.of(context).copyWith(
-          colorScheme: const ColorScheme.dark(
-            primary: _accent,
-            surface: _card,
-          ),
-        ),
-        child: child!,
+      isScrollControlled: true,
+      backgroundColor: _card,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
+      builder: (_) => _AlarmEditor(existing: existing),
     );
-    if (picked == null) return;
-    setState(() {
-      _alarms.add(
-        _AlarmItem(time: picked, label: 'Будильник', days: 'Щодня'),
+    if (result == null) return;
+
+    if (existing == null) {
+      await _service.add(
+        hour: result.time.hour,
+        minute: result.time.minute,
+        label: result.label,
+        days: result.days,
       );
-      _alarms.sort((a, b) =>
-          (a.time.hour * 60 + a.time.minute) -
-          (b.time.hour * 60 + b.time.minute));
-    });
+    } else {
+      await _service.update(
+        existing,
+        hour: result.time.hour,
+        minute: result.time.minute,
+        label: result.label,
+        days: result.days,
+      );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final nextText = _nextAlarmText();
-
     return Scaffold(
       backgroundColor: _bg,
       body: SafeArea(
-        child: Column(
-          children: [
-            _buildHeader(nextText),
-            Expanded(child: _buildAlarmList()),
-          ],
+        child: ListenableBuilder(
+          listenable: _service,
+          builder: (context, _) => Column(
+            children: [
+              _buildHeader(_nextAlarmText()),
+              Expanded(child: _buildAlarmList()),
+            ],
+          ),
         ),
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _addAlarm,
+        onPressed: () => _openEditor(),
         backgroundColor: _accent,
         foregroundColor: Colors.white,
         icon: const Icon(Icons.add_alarm_rounded),
@@ -240,9 +215,12 @@ class _FirstScreenState extends State<FirstScreen> {
                   color: _accentSoft,
                 ),
                 const SizedBox(width: 8),
-                Text(
-                  nextText ?? 'Усі будильники вимкнені',
-                  style: const TextStyle(color: Colors.white70, fontSize: 14),
+                Flexible(
+                  child: Text(
+                    nextText ?? 'Усі будильники вимкнені',
+                    style:
+                        const TextStyle(color: Colors.white70, fontSize: 14),
+                  ),
                 ),
               ],
             ),
@@ -253,7 +231,8 @@ class _FirstScreenState extends State<FirstScreen> {
   }
 
   Widget _buildAlarmList() {
-    if (_alarms.isEmpty) {
+    final alarms = _service.alarms;
+    if (alarms.isEmpty) {
       return const Center(
         child: Text(
           'Поки що немає будильників',
@@ -264,14 +243,14 @@ class _FirstScreenState extends State<FirstScreen> {
 
     return ListView.separated(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
-      itemCount: _alarms.length,
+      itemCount: alarms.length,
       separatorBuilder: (_, __) => const SizedBox(height: 12),
       itemBuilder: (context, i) {
-        final alarm = _alarms[i];
+        final alarm = alarms[i];
         return Dismissible(
-          key: ObjectKey(alarm),
+          key: ValueKey(alarm.id),
           direction: DismissDirection.endToStart,
-          onDismissed: (_) => setState(() => _alarms.removeAt(i)),
+          onDismissed: (_) => _service.delete(alarm),
           background: Container(
             alignment: Alignment.centerRight,
             padding: const EdgeInsets.only(right: 24),
@@ -283,8 +262,8 @@ class _FirstScreenState extends State<FirstScreen> {
           ),
           child: _AlarmCard(
             alarm: alarm,
-            timeText: _fmt(alarm.time),
-            onChanged: (v) => setState(() => alarm.enabled = v),
+            onTap: () => _openEditor(alarm),
+            onChanged: (v) => _service.setEnabled(alarm, v),
           ),
         );
       },
@@ -295,64 +274,249 @@ class _FirstScreenState extends State<FirstScreen> {
 class _AlarmCard extends StatelessWidget {
   const _AlarmCard({
     required this.alarm,
-    required this.timeText,
+    required this.onTap,
     required this.onChanged,
   });
 
-  final _AlarmItem alarm;
-  final String timeText;
+  final AlarmModel alarm;
+  final VoidCallback onTap;
   final ValueChanged<bool> onChanged;
 
   @override
   Widget build(BuildContext context) {
     final on = alarm.enabled;
+    final subtitle = alarm.label.isEmpty
+        ? alarm.daysText
+        : '${alarm.label} · ${alarm.daysText}';
 
     return AnimatedOpacity(
       duration: const Duration(milliseconds: 200),
       opacity: on ? 1 : 0.55,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-        decoration: BoxDecoration(
-          color: _FirstScreenState._card,
+      child: Material(
+        color: _FirstScreenState._card,
+        borderRadius: BorderRadius.circular(22),
+        child: InkWell(
           borderRadius: BorderRadius.circular(22),
-          border: Border.all(
-            color: on
-                ? _FirstScreenState._accent.withValues(alpha: 0.5)
-                : Colors.transparent,
-          ),
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    timeText,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 38,
-                      fontWeight: FontWeight.w300,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    '${alarm.label} · ${alarm.days}',
-                    style: const TextStyle(
-                      color: Colors.white60,
-                      fontSize: 14,
-                    ),
-                  ),
-                ],
+          onTap: onTap,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(
+                color: on
+                    ? _FirstScreenState._accent.withValues(alpha: 0.5)
+                    : Colors.transparent,
               ),
             ),
-            Switch(
-              value: on,
-              onChanged: onChanged,
-              activeColor: Colors.white,
-              activeTrackColor: _FirstScreenState._accent,
-              inactiveThumbColor: Colors.white54,
-              inactiveTrackColor: Colors.white12,
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        alarm.timeText,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 38,
+                          fontWeight: FontWeight.w300,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(
+                  value: on,
+                  onChanged: onChanged,
+                  activeThumbColor: Colors.white,
+                  activeTrackColor: _FirstScreenState._accent,
+                  inactiveThumbColor: Colors.white54,
+                  inactiveTrackColor: Colors.white12,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _EditorResult {
+  const _EditorResult(this.time, this.label, this.days);
+
+  final TimeOfDay time;
+  final String label;
+  final Set<int> days;
+}
+
+/// Нижня панель створення/редагування будильника.
+class _AlarmEditor extends StatefulWidget {
+  const _AlarmEditor({this.existing});
+
+  final AlarmModel? existing;
+
+  @override
+  State<_AlarmEditor> createState() => _AlarmEditorState();
+}
+
+class _AlarmEditorState extends State<_AlarmEditor> {
+  late TimeOfDay _time;
+  late Set<int> _days;
+  late final TextEditingController _label;
+
+  @override
+  void initState() {
+    super.initState();
+    final a = widget.existing;
+    _time = a == null
+        ? TimeOfDay.now()
+        : TimeOfDay(hour: a.hour, minute: a.minute);
+    _days = {...?a?.days};
+    _label = TextEditingController(text: a?.label ?? '');
+  }
+
+  @override
+  void dispose() {
+    _label.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickTime() async {
+    final picked = await showTimePicker(
+      context: context,
+      initialTime: _time,
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(alwaysUse24HourFormat: true),
+        child: Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: const ColorScheme.dark(
+              primary: _FirstScreenState._accent,
+              surface: _FirstScreenState._card,
+            ),
+          ),
+          child: child!,
+        ),
+      ),
+    );
+    if (picked != null) setState(() => _time = picked);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final timeText =
+        '${_time.hour.toString().padLeft(2, '0')}:${_time.minute.toString().padLeft(2, '0')}';
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        20,
+        20,
+        20,
+        20 + MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: TextButton(
+                onPressed: _pickTime,
+                child: Text(
+                  timeText,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 64,
+                    fontWeight: FontWeight.w200,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _label,
+              style: const TextStyle(color: Colors.white),
+              textCapitalization: TextCapitalization.sentences,
+              decoration: InputDecoration(
+                hintText: 'Назва (необовʼязково)',
+                hintStyle: const TextStyle(color: Colors.white38),
+                filled: true,
+                fillColor: Colors.white10,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'Повтор',
+              style: TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                for (var d = 1; d <= 7; d++)
+                  FilterChip(
+                    label: Text(AlarmModel.shortDayNames[d - 1]),
+                    selected: _days.contains(d),
+                    showCheckmark: false,
+                    selectedColor: _FirstScreenState._accent,
+                    backgroundColor: Colors.white10,
+                    labelStyle: const TextStyle(color: Colors.white),
+                    side: BorderSide.none,
+                    onSelected: (v) => setState(() {
+                      v ? _days.add(d) : _days.remove(d);
+                    }),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _days.isEmpty
+                  ? 'Без повтору — спрацює один раз'
+                  : 'Повторюється у вибрані дні',
+              style: const TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white24),
+                      minimumSize: const Size.fromHeight(52),
+                    ),
+                    child: const Text('Скасувати'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: () => Navigator.of(context).pop(
+                      _EditorResult(_time, _label.text.trim(), {..._days}),
+                    ),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _FirstScreenState._accent,
+                      minimumSize: const Size.fromHeight(52),
+                    ),
+                    child: const Text('Зберегти'),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
